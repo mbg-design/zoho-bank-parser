@@ -102,7 +102,7 @@ async def parse_bank_statement(request: Request):
                 "lines": [],
             }
 
-        content = await uploaded_file.read()
+        content = uploaded_file.file.read()
 
         wb = load_workbook(BytesIO(content), data_only=True)
         ws = wb.active
