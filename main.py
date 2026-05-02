@@ -3,6 +3,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from openpyxl import load_workbook
 from io import BytesIO
 from datetime import datetime
+import base64
 import re
 
 app = FastAPI()
@@ -77,6 +78,94 @@ def extract_contact(description, amount):
     return extract_field(description, ["Gönderen", "Adı Soyadı"])
 
 
+def parse_excel_bytes(content: bytes):
+    wb = load_workbook(BytesIO(content), data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+
+    header_index = None
+    headers = []
+
+    for i, row in enumerate(rows):
+        values = [str(c).strip() if c is not None else "" for c in row]
+        joined = " ".join(values)
+
+        if "İşlem Tarihi" in joined and "Açıklama" in joined and "Tutar" in joined:
+            header_index = i
+            headers = values
+            break
+
+    if header_index is None:
+        return {
+            "success": False,
+            "error": "Header row not found",
+            "lines": [],
+        }
+
+    def col(keyword):
+        for idx, h in enumerate(headers):
+            if keyword.lower() in h.lower():
+                return idx
+        return -1
+
+    date_col = col("İşlem Tarihi")
+    desc_col = col("Açıklama")
+    amount_col = col("Tutar")
+    balance_col = col("Bakiye")
+    ref_col = col("Referans")
+
+    if date_col < 0 or desc_col < 0 or amount_col < 0:
+        return {
+            "success": False,
+            "error": "Required columns not found",
+            "headers": headers,
+            "lines": [],
+        }
+
+    lines = []
+
+    for row in rows[header_index + 1:]:
+        if not row:
+            continue
+
+        if row[date_col] is None:
+            continue
+
+        desc = str(row[desc_col] or "").strip()
+        amount = parse_amount(row[amount_col])
+        balance = parse_amount(row[balance_col]) if balance_col >= 0 else 0
+        ref = str(row[ref_col] or "").strip() if ref_col >= 0 else ""
+
+        date_value = clean_date(row[date_col])
+        contact_name = extract_contact(desc, amount)
+
+        contact_type = "vendor" if amount < 0 else "customer"
+        transaction_type = "vendor_payment" if amount < 0 else "customer_payment"
+
+        unique_key = f"{ref}_{date_value}_{amount}"
+
+        lines.append(
+            {
+                "islem_tarihi": date_value,
+                "aciklama": desc,
+                "tutar": amount,
+                "bakiye": balance,
+                "referans_no": ref,
+                "contact_name": contact_name,
+                "contact_type": contact_type,
+                "transaction_type": transaction_type,
+                "unique_key": unique_key,
+            }
+        )
+
+    return {
+        "success": True,
+        "count": len(lines),
+        "lines": lines,
+    }
+
+
 @app.get("/")
 def health():
     return {"status": "ok"}
@@ -103,92 +192,36 @@ async def parse_bank_statement(request: Request):
             }
 
         content = uploaded_file.file.read()
+        return parse_excel_bytes(content)
 
-        wb = load_workbook(BytesIO(content), data_only=True)
-        ws = wb.active
-
-        rows = list(ws.iter_rows(values_only=True))
-
-        header_index = None
-        headers = []
-
-        for i, row in enumerate(rows):
-            values = [str(c).strip() if c is not None else "" for c in row]
-            joined = " ".join(values)
-
-            if "İşlem Tarihi" in joined and "Açıklama" in joined and "Tutar" in joined:
-                header_index = i
-                headers = values
-                break
-
-        if header_index is None:
-            return {
-                "success": False,
-                "error": "Header row not found",
-                "lines": [],
-            }
-
-        def col(keyword):
-            for idx, h in enumerate(headers):
-                if keyword.lower() in h.lower():
-                    return idx
-            return -1
-
-        date_col = col("İşlem Tarihi")
-        desc_col = col("Açıklama")
-        amount_col = col("Tutar")
-        balance_col = col("Bakiye")
-        ref_col = col("Referans")
-
-        if date_col < 0 or desc_col < 0 or amount_col < 0:
-            return {
-                "success": False,
-                "error": "Required columns not found",
-                "headers": headers,
-                "lines": [],
-            }
-
-        lines = []
-
-        for row in rows[header_index + 1:]:
-            if not row:
-                continue
-
-            if row[date_col] is None:
-                continue
-
-            desc = str(row[desc_col] or "").strip()
-            amount = parse_amount(row[amount_col])
-            balance = parse_amount(row[balance_col]) if balance_col >= 0 else 0
-            ref = str(row[ref_col] or "").strip() if ref_col >= 0 else ""
-
-            date_value = clean_date(row[date_col])
-            contact_name = extract_contact(desc, amount)
-
-            contact_type = "vendor" if amount < 0 else "customer"
-            transaction_type = "vendor_payment" if amount < 0 else "customer_payment"
-
-            unique_key = f"{ref}_{date_value}_{amount}"
-
-            lines.append(
-                {
-                    "islem_tarihi": date_value,
-                    "aciklama": desc,
-                    "tutar": amount,
-                    "bakiye": balance,
-                    "referans_no": ref,
-                    "contact_name": contact_name,
-                    "contact_type": contact_type,
-                    "transaction_type": transaction_type,
-                    "unique_key": unique_key,
-                }
-            )
-
+    except Exception as e:
         return {
-            "success": True,
-            "count": len(lines),
-            "lines": lines,
+            "success": False,
+            "error": str(e),
+            "lines": [],
         }
+
+
+@app.post("/parse-bank-statement-base64")
+async def parse_bank_statement_base64(request: Request):
+    try:
+        data = await request.json()
+
+        content = data.get("content", "")
+
+        if not content:
+            return {
+                "success": False,
+                "error": "No content received",
+                "lines": [],
+            }
+
+        if "," in content and "base64" in content[:100].lower():
+            content = content.split(",", 1)[1]
+
+        file_bytes = base64.b64decode(content)
+
+        return parse_excel_bytes(file_bytes)
 
     except Exception as e:
         return {
